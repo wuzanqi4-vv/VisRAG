@@ -1,7 +1,7 @@
 # 版本备份与回退
 
 本地目录 `D:/CodePractice/VisRAG` 用于编辑和 Git 管理。
-遵循 AGENTS.MD，实验与集成测试在 `/home/wuzanqi/VisRAG` 对应的 SSH 服务器执行。
+遵循 AGENTS.md，实验与集成测试在 `/home/wuzanqi/VisRAG` 对应的 SSH 服务器执行。
 
 ## 个人 GitHub 仓库
 
