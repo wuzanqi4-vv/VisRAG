@@ -124,6 +124,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -166,6 +168,13 @@ cython_debug/
 
 # Knowledge Base
 kb/
+
+# Private benchmark configuration and generated experiment artifacts.
+configs/benchmark/paths.server.yaml
+artifacts/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 /build
 /checkpoints
