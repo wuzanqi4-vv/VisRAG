@@ -1,61 +1,39 @@
-﻿"""PDF rendering utility to rasterize PDF pages into PNG images.
-
-Supports caching to prevent redundant rendering and PyMuPDF (fitz) with 200 DPI.
-"""
-
-import os
+"""Content-addressed, page-resumable PDF rendering."""
 from pathlib import Path
-from typing import List
-import fitz  # PyMuPDF
+import fitz
 from PIL import Image
+from io_utils import atomic_path, file_digest, fingerprint
 
 
-def get_pdf_page_count(pdf_path: str) -> int:
-    """Returns the total number of pages in the given PDF file."""
-    with fitz.open(pdf_path) as doc:
-        return len(doc)
+def get_pdf_page_count(pdf_path):
+    """Returns the physical page count."""
+    with fitz.open(pdf_path) as document:
+        return len(document)
 
 
-def render_pdf_to_images(
-    pdf_path: str,
-    output_dir: Path,
-    dpi: int = 200,
-    force_rebuild: bool = False,
-) -> List[str]:
-    """Renders all pages of a PDF to images with caching.
-
-    Args:
-        pdf_path: Path to the input PDF file.
-        output_dir: Base directory where page images will be cached.
-        dpi: Resolution in DPI (default 200).
-        force_rebuild: If True, re-renders even if images exist.
-
-    Returns:
-        List of absolute file paths to the rendered page images, 1-indexed in order.
-    """
-    pdf_name = Path(pdf_path).stem
-    target_dir = output_dir / pdf_name
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    with fitz.open(pdf_path) as doc:
-        total_pages = len(doc)
-        image_paths: List[str] = []
-
-        # Check if already fully rendered
-        existing_images = [
-            target_dir / f"page_{page_num:04d}.png"
-            for page_num in range(1, total_pages + 1)
-        ]
-        if not force_rebuild and all(p.exists() for p in existing_images):
-            return [str(p.resolve()) for p in existing_images]
-
-        # Render missing pages
-        for page_idx, page in enumerate(doc):
-            page_num = page_idx + 1
-            out_img_path = target_dir / f"page_{page_num:04d}.png"
-            if force_rebuild or not out_img_path.exists():
-                pix = page.get_pixmap(dpi=dpi)
-                pix.save(str(out_img_path))
-            image_paths.append(str(out_img_path.resolve()))
-
-    return image_paths
+def render_pdf_to_images(pdf_path, output_dir, dpi=200, force_rebuild=False):
+    """Reuses valid pages only for matching PDF contents and DPI."""
+    identity = fingerprint([file_digest(pdf_path), dpi, "rgb-render-v2"])
+    target = Path(output_dir) / identity
+    target.mkdir(parents=True, exist_ok=True)
+    paths = []
+    with fitz.open(pdf_path) as document:
+        if not len(document):
+            raise ValueError(f"Empty PDF: {pdf_path}")
+        for index in range(len(document)):
+            path = target / f"page_{index + 1}.png"
+            valid = False
+            if path.is_file() and not force_rebuild:
+                try:
+                    with Image.open(path) as image:
+                        image.verify()
+                    valid = True
+                except (OSError, SyntaxError):
+                    pass
+            if not valid:
+                pixmap = document[index].get_pixmap(
+                    dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+                with atomic_path(path) as temporary:
+                    pixmap.save(str(temporary))
+            paths.append(str(path.resolve()))
+    return paths

@@ -1,17 +1,23 @@
-﻿import sys
-sys.path.append("/home/wuzanqi/VisRAG/visrag_scripts/baseline_eval")
+"""Explicit API smoke command; import/collection never sends a request."""
+import argparse
+import json
 import config
 from generate_qwen import QwenGenerator
 
-generator = QwenGenerator(
-    api_key=config.QWEN_API_KEY,
-    base_url=config.QWEN_BASE_URL,
-    model_name=config.QWEN_MODEL_NAME,
-)
 
-print("Testing API connectivity with model:", config.QWEN_MODEL_NAME)
-res = generator.generate_answer(
-    question="请回答：1+1等于几？只需回答数字即可。",
-    image_paths=[],  # 空图片列表测试纯文本基础能力
-)
-print("API Response Result:", res)
+def main():
+    """Tests credentials only when the user explicitly runs this script."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env-file")
+    args = parser.parse_args()
+    settings = config.load_settings(args.env_file)
+    config.validate_api(settings)
+    generator = QwenGenerator(
+        settings["api_key"], settings["base_url"], settings["model_name"])
+    print(json.dumps(generator.generate_answer(
+        "What is 1 + 1? Answer with a number.", [], max_retries=1),
+        ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

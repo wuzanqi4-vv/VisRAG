@@ -1,249 +1,237 @@
-﻿"""Unified orchestrator for visual RAG baseline evaluation.
-
-Usage:
-    python run_eval.py --dataset nation_standard_bench --retriever visrag --top_k 5 --resume
-    python run_eval.py --dataset doc_bench --retriever colpali --top_k 5 --resume
-"""
-
+"""Run one resumable Top-k benchmark, or export an existing run."""
 import argparse
+from datetime import datetime, timezone
 import json
-import os
-import sys
-import time
+import importlib.metadata
 from pathlib import Path
-from typing import Dict, List, Set
+import time
+import uuid
+from urllib.parse import urlsplit, urlunsplit
 
-from config import (
-    CACHE_IMAGES_DIR,
-    CACHE_INDEX_DIR,
-    COLPALI_PATH,
-    DOC_BENCH_DIR,
-    NATION_STANDARD_BENCH_DIR,
-    PDF_RENDER_DPI,
-    QWEN_API_KEY,
-    QWEN_BASE_URL,
-    QWEN_MODEL_NAME,
-    RESULTS_DIR,
-    TOP_K,
-    VISRAG_RET_PATH,
-)
+import config
 from data_loader import load_dataset
-from generate_qwen import QwenGenerator
-from render_pdf import render_pdf_to_images
+from generate_qwen import PROMPT, QwenGenerator
+from io_utils import (
+    file_digest, fingerprint, model_identity, run_lock, write_json,
+)
+from state import ExperimentState
 
 
-def load_completed_question_ids(predictions_file: Path) -> Set[str]:
-    """Reads existing predictions file to determine completed questions for resume."""
-    completed = set()
-    if predictions_file.exists():
-        with open(predictions_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        record = json.loads(line)
-                        qid = record.get("question_id")
-                        if qid:
-                            completed.add(qid)
-                    except json.JSONDecodeError:
-                        continue
-    return completed
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Run Visual RAG Baseline Evaluation.")
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        required=True,
-        choices=["nation_standard_bench", "doc_bench"],
-        help="Dataset to evaluate on.",
-    )
-    parser.add_argument(
-        "--retriever",
-        type=str,
-        required=True,
-        choices=["visrag", "colpali"],
-        help="Retriever model to use.",
-    )
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        default=TOP_K,
-        help="Number of retrieved pages to feed to generator (default: 5).",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        default=True,
-        help="Resume from previous checkpoint if available.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional limit on number of questions to process (for smoke testing).",
-    )
+def parse_args() -> argparse.Namespace:
+    """Parses server runtime arguments without importing GPU models."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", choices=[
+        "nation_standard_bench", "doc_bench"])
+    parser.add_argument("--retriever", choices=["visrag", "colpali"])
+    parser.add_argument("--top_k", "--top-k", type=int, default=config.TOP_K)
+    parser.add_argument("--dpi", type=int, default=config.PDF_RENDER_DPI)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--env-file", type=Path)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction,
+                        default=True)
+    parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--thinking-mode", choices=[
+        "provider_default", "enabled", "disabled"], default="provider_default")
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--export-only", action="store_true")
+    parser.add_argument("--run-dir", type=Path)
     args = parser.parse_args()
+    if not args.export_only and (not args.dataset or not args.retriever):
+        parser.error("--dataset and --retriever are required.")
+    for name in ("top_k", "dpi", "max_retries", "max_tokens", "timeout"):
+        if getattr(args, name) <= 0:
+            parser.error(f"{name} must be positive.")
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit must be positive.")
+    return args
 
-    # 1. Resolve dataset directory and items
-    if args.dataset == "nation_standard_bench":
-        data_dir = NATION_STANDARD_BENCH_DIR
-    else:
-        data_dir = DOC_BENCH_DIR
 
-    print(f"=== Starting Visual RAG Baseline Eval ===")
-    print(f"Dataset:   {args.dataset} ({data_dir})")
-    print(f"Retriever: {args.retriever}")
-    print(f"Top-K:     {args.top_k}")
-    print(f"Resume:    {args.resume}")
+def export_existing(directory: Path) -> None:
+    """Regenerates artifacts without reading .env or loading a model."""
+    if directory is None or not (directory / "state.sqlite3").is_file():
+        raise ValueError("--run-dir must identify an existing experiment.")
+    with run_lock(directory / "run.lock"):
+        state = ExperimentState(directory, [])
+        try:
+            print(json.dumps(state.export(), indent=2))
+        finally:
+            state.close()
 
-    items = load_dataset(args.dataset, data_dir)
-    print(f"Total QA items loaded: {len(items)}")
 
-    if not items:
-        print(f"[Error] No QA items found in {data_dir}. Check paths.")
-        sys.exit(1)
-
-    if args.limit:
-        items = items[: args.limit]
-        print(f"Applied limit: evaluating first {args.limit} items.")
-
-    # 2. Setup output directories and files
-    out_dir = RESULTS_DIR / args.dataset / f"{args.retriever}_top{args.top_k}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    predictions_file = out_dir / "predictions.jsonl"
-    retrieval_log_file = out_dir / "retrieved_pages.jsonl"
-    summary_file = out_dir / "summary.json"
-
-    completed_qids = load_completed_question_ids(predictions_file) if args.resume else set()
-    print(f"Already completed items: {len(completed_qids)}")
-
-    # 3. Initialize retriever
-    if args.retriever == "visrag":
-        from retriever_visrag import VisRAGRetriever
-        retriever = VisRAGRetriever(str(VISRAG_RET_PATH))
-    else:
-        from retriever_colpali import ColPaliRetriever
-        retriever = ColPaliRetriever(str(COLPALI_PATH))
-
-    # 4. Initialize Qwen generator
-    generator = QwenGenerator(
-        api_key=QWEN_API_KEY,
-        base_url=QWEN_BASE_URL,
-        model_name=QWEN_MODEL_NAME,
-    )
-
-    # 5. Process questions
-    processed_count = 0
-    total_tokens = 0
-    total_time = 0.0
-
-    # Open append-only files for immediate persistence
-    pred_f = open(predictions_file, "a", encoding="utf-8")
-    ret_f = open(retrieval_log_file, "a", encoding="utf-8")
-
-    try:
-        for idx, item in enumerate(items):
-            qid = item["question_id"]
-            if qid in completed_qids:
-                continue
-
-            doc_id = item["doc_id"]
-            pdf_path = item["pdf_path"]
-            question = item["question"]
-
-            print(f"[{idx + 1}/{len(items)}] Processing {doc_id} - {qid}...")
-
-            # Step 5.1: Render PDF pages (cached)
-            rendered_images = render_pdf_to_images(
-                pdf_path=pdf_path,
-                output_dir=CACHE_IMAGES_DIR / args.dataset,
-                dpi=PDF_RENDER_DPI,
-            )
-
-            # Step 5.2: Document-level top-k retrieval
-            pdf_stem = Path(pdf_path).stem
-            index_cache = CACHE_INDEX_DIR / args.dataset / args.retriever / f"{pdf_stem}.npy"
-
-            retrieval_start = time.time()
-            retrieved = retriever.retrieve(
-                query=question,
-                image_paths=rendered_images,
-                top_k=args.top_k,
-                cache_file=index_cache,
-            )
-            retrieval_time = time.time() - retrieval_start
-
-            retrieved_pages = [r[0] for r in retrieved]
-            retrieved_scores = [r[1] for r in retrieved]
-            retrieved_img_paths = [r[2] for r in retrieved]
-
-            # Log retrieval
-            ret_entry = {
-                "doc_id": doc_id,
-                "question_id": qid,
-                "question": question,
-                "retrieved_pages": retrieved_pages,
-                "retrieved_scores": retrieved_scores,
-                "retrieval_time_sec": retrieval_time,
-            }
-            ret_f.write(json.dumps(ret_entry, ensure_ascii=False) + "\n")
-            ret_f.flush()
-
-            # Step 5.3: Call Qwen API for Generation
-            gen_res = generator.generate_answer(
-                question=question,
-                image_paths=retrieved_img_paths,
-            )
-
-            # Log prediction
-            pred_entry = {
-                "dataset": item["dataset"],
-                "doc_id": doc_id,
-                "question_id": qid,
-                "question": question,
-                "ground_truth_answer": item.get("ground_truth_answer", ""),
-                "evidence_pages": item.get("evidence_pages", []),
-                "retrieved_pages": retrieved_pages,
-                "prediction": gen_res.get("prediction", ""),
-                "prompt_tokens": gen_res.get("prompt_tokens", 0),
-                "completion_tokens": gen_res.get("completion_tokens", 0),
-                "total_tokens": gen_res.get("total_tokens", 0),
-                "generation_latency_sec": gen_res.get("latency_sec", 0.0),
-                "status": gen_res.get("status", "unknown"),
-            }
-            pred_f.write(json.dumps(pred_entry, ensure_ascii=False) + "\n")
-            pred_f.flush()
-
-            processed_count += 1
-            total_tokens += gen_res.get("total_tokens", 0)
-            total_time += gen_res.get("latency_sec", 0.0)
-
-            print(f"    Done {qid}. Latency: {gen_res.get('latency_sec', 0.0):.2f}s, Tokens: {gen_res.get('total_tokens', 0)}")
-
-    finally:
-        pred_f.close()
-        ret_f.close()
-
-    # 6. Save summary statistics
-    all_completed = load_completed_question_ids(predictions_file)
-    summary = {
-        "dataset": args.dataset,
-        "retriever": args.retriever,
-        "top_k": args.top_k,
-        "total_questions": len(items),
-        "completed_questions": len(all_completed),
-        "newly_processed_in_this_run": processed_count,
-        "total_tokens_accumulated": total_tokens,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+def main() -> None:
+    """Runs generation only; evaluation remains a separate downstream task."""
+    args = parse_args()
+    if args.export_only:
+        export_existing(args.run_dir)
+        return
+    settings = config.load_settings(args.env_file)
+    items = load_dataset(args.dataset, settings["data_dir"])
+    if args.limit is not None:
+        items = items[:args.limit]
+    model_path = settings["model_dir"] / (
+        "VisRAG-Ret" if args.retriever == "visrag" else "colpali-v1.3-hf")
+    model_signature = model_identity(model_path)
+    pdf_hashes = {path: file_digest(path)
+                  for path in {item["pdf_path"] for item in items}}
+    public_items = [
+        {key: value for key, value in item.items() if key != "pdf_path"}
+        for item in items
+    ]
+    endpoint = urlsplit(settings["base_url"])
+    public_endpoint = urlunsplit((endpoint.scheme,
+                                 endpoint.netloc.rsplit("@", 1)[-1],
+                                 endpoint.path, "", ""))
+    manifest = {
+        "schema": 2, "dataset": args.dataset, "retriever": args.retriever,
+        "top_k": args.top_k, "dpi": args.dpi, "limit": args.limit,
+        "model_identity": model_signature,
+        "data_identity": fingerprint([
+            public_items, sorted(pdf_hashes.values())]),
+        "api_model": settings["model_name"],
+        "api_root": public_endpoint, "api_format": settings["api_format"],
+        "max_tokens": args.max_tokens, "thinking_mode": args.thinking_mode,
+        "prompt": PROMPT,
+        "dependencies": {
+            name: importlib.metadata.version(name)
+            for name in ("torch", "numpy", "transformers", "Pillow",
+                         "requests", "PyMuPDF")
+        },
+        "code_identity": fingerprint([
+            [path.name, file_digest(path)]
+            for path in sorted(Path(__file__).parent.glob("*.py"))
+            if not path.name.startswith("test_")
+        ]),
     }
-    with open(summary_file, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+    if args.validate_only:
+        config.validate_api(settings)
+        print(json.dumps({
+            "dataset": args.dataset, "questions": len(items),
+            "unique_keys": len({item["question_key"] for item in items}),
+            "model_path": str(model_path),
+            "configured_model": settings["model_name"],
+        }, ensure_ascii=False, indent=2))
+        return
 
-    print(f"\n=== Evaluation Finished ===")
-    print(f"Summary saved to: {summary_file}")
-    print(f"Total Completed: {len(all_completed)} / {len(items)}")
+    identity = fingerprint(manifest)
+    if not args.resume:
+        identity += "_" + uuid.uuid4().hex[:8]
+    directory = (settings["artifact_dir"] / "runs" / args.dataset
+                 / args.retriever / f"top{args.top_k}_{identity}")
+    cache_root = settings["artifact_dir"] / "cache"
+    with run_lock(directory / "run.lock"):
+        state = ExperimentState(directory, items)
+        write_json(directory / "manifest.json", manifest)
+        retriever = None
+        generator = None
+        session_start = time.perf_counter()
+        session_timestamp = datetime.now(timezone.utc).isoformat()
+        stages = {"render_sec": 0.0, "retrieval_sec": 0.0,
+                  "model_load_sec": 0.0, "generation_sec": 0.0}
+        rendered = {}
+        try:
+            for item in items:
+                key = item["question_key"]
+                previous = state.result(key)
+                if previous and previous["status"] in {"success", "truncated"}:
+                    continue
+                count = state.attempt_count(key)
+                if (previous and previous["status"] == "failed"
+                        and not args.retry_failed
+                        and (not previous.get("retryable")
+                             or count >= args.max_retries)):
+                    continue
+                # API configuration is checked before GPU/render work. Exports
+                # and completely cached runs do not need valid credentials.
+                if generator is None:
+                    config.validate_api(settings)
+                    generator = QwenGenerator(
+                        settings["api_key"], settings["base_url"],
+                        settings["model_name"], max_tokens=args.max_tokens,
+                        timeout=args.timeout, thinking_mode=args.thinking_mode)
+                retrieval = state.retrieval(key)
+                if retrieval and not all(
+                        Path(path).is_file()
+                        for path in retrieval["image_paths"]):
+                    retrieval = None
+                if retrieval is None:
+                    if retriever is None:
+                        started = time.perf_counter()
+                        if args.retriever == "visrag":
+                            from retriever_visrag import VisRAGRetriever
+                            retriever = VisRAGRetriever(str(model_path))
+                        else:
+                            from retriever_colpali import ColPaliRetriever
+                            retriever = ColPaliRetriever(str(model_path))
+                        stages["model_load_sec"] += (
+                            time.perf_counter() - started)
+                    try:
+                        from render_pdf import render_pdf_to_images
+                        pdf = item["pdf_path"]
+                        if pdf not in rendered:
+                            started = time.perf_counter()
+                            rendered[pdf] = render_pdf_to_images(
+                                pdf, cache_root / "pages", args.dpi)
+                            stages["render_sec"] += (
+                                time.perf_counter() - started)
+                        images = rendered[pdf]
+                        index_id = fingerprint([
+                            pdf_hashes[pdf], args.dpi, model_signature,
+                            manifest["code_identity"],
+                            manifest["dependencies"]])
+                        extension = (
+                            ".npy" if args.retriever == "visrag" else ".npz")
+                        cache = (cache_root / "indexes" / args.retriever
+                                 / (index_id + extension))
+                        started = time.perf_counter()
+                        ranked = retriever.retrieve(
+                            item["question"], images, args.top_k, cache)
+                        elapsed = time.perf_counter() - started
+                        stages["retrieval_sec"] += elapsed
+                        retrieval = {
+                            "pages": [row[0] for row in ranked],
+                            "scores": [row[1] for row in ranked],
+                            "image_paths": [row[2] for row in ranked],
+                            "retrieval_time_sec": elapsed,
+                            "requested_top_k": args.top_k,
+                            "actual_top_k": len(ranked),
+                        }
+                        state.save_retrieval(key, retrieval)
+                    except (OSError, ValueError, RuntimeError) as error:
+                        state.save_result(key, {
+                            "status": "failed", "prediction": None,
+                            "stage": "retrieval", "retryable": False,
+                            "error": str(error)})
+                        state.export()
+                        continue
+                budget = (args.max_retries if args.retry_failed
+                          else args.max_retries - count)
+                started = time.perf_counter()
+                result = generator.generate_answer(
+                    item["question"], retrieval["image_paths"],
+                    max_retries=budget,
+                    on_attempt=lambda record: state.record_attempt(key, record))
+                stages["generation_sec"] += time.perf_counter() - started
+                state.save_result(key, result)
+                state.export()
+                print(f"{item['document_key']} / {item['question_id']}: "
+                      f"{result['status']}")
+                if result.get("http_status") in {401, 403}:
+                    raise RuntimeError(
+                        "API authentication rejected; "
+                        "remaining tasks preserved.")
+        finally:
+            # Each execution gets an independent timing record, never replacing
+            # historical elapsed time when a resume performs no new work.
+            stages["session_elapsed_sec"] = time.perf_counter() - session_start
+            stages["started_at"] = session_timestamp
+            write_json(directory / "sessions" / (uuid.uuid4().hex + ".json"),
+                       stages)
+            state.export()
+            state.close()
+            print(f"Results: {directory}")
 
 
 if __name__ == "__main__":

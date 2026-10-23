@@ -1,115 +1,81 @@
-﻿"""Data loaders for NationStandardBench and DocBench.
-
-Uniformly normalizes dataset items into standardized evaluation dictionaries:
-{
-    "dataset": str,
-    "doc_id": str,
-    "question_id": str,
-    "question": str,
-    "ground_truth_answer": str,
-    "evidence_pages": list[int],
-    "pdf_path": str,
-}
-"""
-
+"""Read-only dataset adapters preserving original annotations."""
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from io_utils import fingerprint
 
 
-def load_nation_standard_bench(dataset_dir: Path) -> List[Dict[str, Any]]:
-    """Loads all QA items and associated PDF paths from NationStandardBench."""
-    items: List[Dict[str, Any]] = []
-    if not dataset_dir.exists():
-        print(f"[Warning] Dataset path does not exist: {dataset_dir}")
-        return items
-
-    categories = ["Electrical", "Energy", "Medical", "Tobacco"]
-    for category in categories:
-        cat_dir = dataset_dir / category
-        if not cat_dir.is_dir():
-            continue
-
-        for doc_dir in sorted(cat_dir.iterdir()):
-            if not doc_dir.is_dir():
-                continue
-
-            qa_file = doc_dir / "qa.jsonl"
-            pdf_candidates = list(doc_dir.glob("*.pdf"))
-            if not qa_file.exists() or not pdf_candidates:
-                continue
-
-            pdf_path = str(pdf_candidates[0].resolve())
-            doc_id = doc_dir.name
-
-            with open(qa_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    record = json.loads(line)
-                    items.append({
-                        "dataset": "NationStandardBench",
-                        "category": category,
-                        "doc_id": doc_id,
-                        "question_id": record.get("question_id", ""),
-                        "question": record.get("question", ""),
-                        "ground_truth_answer": record.get("answer", ""),
-                        "evidence_pages": record.get("evidence_pages", []),
-                        "pdf_path": pdf_path,
-                    })
-
-    return items
-
-
-def load_doc_bench(dataset_dir: Path) -> List[Dict[str, Any]]:
-    """Loads all QA items and associated PDF paths from DocBench."""
-    items: List[Dict[str, Any]] = []
-    if not dataset_dir.exists():
-        print(f"[Warning] Dataset path does not exist: {dataset_dir}")
-        return items
-
-    for doc_dir in sorted(dataset_dir.iterdir()):
-        if not doc_dir.is_dir() or not doc_dir.name.isdigit():
-            continue
-
-        doc_idx = doc_dir.name
-        qa_file = doc_dir / f"{doc_idx}_qa.jsonl"
-        pdf_candidates = list(doc_dir.glob("*.pdf"))
-
-        if not qa_file.exists() or not pdf_candidates:
-            continue
-
-        pdf_path = str(pdf_candidates[0].resolve())
-
-        with open(qa_file, "r", encoding="utf-8") as f:
-            for q_idx, line in enumerate(f):
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                items.append({
-                    "dataset": "DocBench",
-                    "doc_id": doc_idx,
-                    "question_id": f"doc_{doc_idx}_q{q_idx}",
-                    "question": record.get("question", ""),
-                    "ground_truth_answer": record.get("answer", ""),
-                    "evidence_pages": [],  # DocBench evidence is text snippet
-                    "evidence_text": record.get("evidence", ""),
-                    "pdf_path": pdf_path,
-                })
-
-    return items
-
-
-def load_dataset(dataset_name: str, base_dir: Path) -> List[Dict[str, Any]]:
-    """Convenience dispatcher to load specified dataset."""
-    name_lower = dataset_name.lower().replace("-", "_").replace(" ", "_")
-    if "nation" in name_lower:
-        target_dir = base_dir / "NationStandardBench" if (base_dir / "NationStandardBench").exists() else base_dir
-        return load_nation_standard_bench(target_dir)
-    elif "doc" in name_lower:
-        target_dir = base_dir / "docBench" if (base_dir / "docBench").exists() else base_dir
-        return load_doc_bench(target_dir)
+def _load_documents(root: Path, dataset: str) -> list[dict]:
+    """Validates document/QA pairing and assigns globally unique keys."""
+    root = Path(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Missing dataset: {root}")
+    documents = []
+    if dataset == "nation_standard_bench":
+        for category in ("Electrical", "Energy", "Medical", "Tobacco"):
+            folder = root / category
+            if not folder.is_dir():
+                raise FileNotFoundError(f"Missing category: {folder}")
+            documents.extend((p, p / "qa.jsonl")
+                             for p in sorted(folder.iterdir()) if p.is_dir())
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Expected 'NationStandardBench' or 'DocBench'.")
+        documents = [(p, p / f"{p.name}_qa.jsonl")
+                     for p in sorted(root.iterdir())
+                     if p.is_dir() and p.name.isdigit()]
+    items, keys = [], set()
+    for folder, qa_file in documents:
+        pdfs = sorted(folder.glob("*.pdf"))
+        if not qa_file.is_file() or len(pdfs) != 1:
+            raise ValueError(f"Expected one PDF and a QA file: {folder}")
+        document_key = folder.relative_to(root).as_posix()
+        for line_no, line in enumerate(
+                qa_file.read_text(encoding="utf-8-sig").splitlines(), 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            question = record.get("question")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError(f"Invalid question: {qa_file}:{line_no}")
+            if not isinstance(record.get("answer"), str):
+                raise ValueError(f"Invalid answer: {qa_file}:{line_no}")
+            qid = (record.get("question_id")
+                   if dataset == "nation_standard_bench"
+                   else fingerprint(question))
+            if not qid:
+                raise ValueError(f"Missing question ID: {qa_file}:{line_no}")
+            key = fingerprint([dataset, document_key, qid])
+            if key in keys:
+                raise ValueError(f"Duplicate question: {qa_file}:{line_no}")
+            keys.add(key)
+            items.append({
+                **record, "dataset": dataset, "document_key": document_key,
+                "doc_id": record.get("doc_id", folder.name),
+                "question_id": qid, "question_key": key,
+                "question_type": record.get(
+                    "question_type", record.get("type")),
+                "ground_truth_answer": record["answer"],
+                "pdf_path": str(pdfs[0].resolve()), "source_line": line_no,
+            })
+    if not items:
+        raise ValueError(f"No questions: {root}")
+    return items
+
+
+def load_nation_standard_bench(dataset_dir: Path) -> list[dict]:
+    """Loads NationStandardBench."""
+    return _load_documents(dataset_dir, "nation_standard_bench")
+
+
+def load_doc_bench(dataset_dir: Path) -> list[dict]:
+    """Loads DocBench with stable question-text IDs."""
+    return _load_documents(dataset_dir, "doc_bench")
+
+
+def load_dataset(dataset_name: str, base_dir: Path) -> list[dict]:
+    """Accepts the dataset directory or its parent."""
+    names = {"nation_standard_bench": "NationStandardBench",
+             "doc_bench": "docBench"}
+    if dataset_name not in names:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    root = Path(base_dir)
+    target = root / names[dataset_name]
+    return _load_documents(target if target.is_dir() else root, dataset_name)

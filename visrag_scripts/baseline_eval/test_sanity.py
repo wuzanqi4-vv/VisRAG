@@ -1,17 +1,20 @@
-﻿import sys
-sys.path.append("/home/wuzanqi/VisRAG/visrag_scripts/baseline_eval")
+"""Explicit read-only dataset sanity command, without credential output."""
+import argparse
 import config
 from data_loader import load_dataset
 
-print("1. Config:")
-print("  DATA DIR:", config.BASE_DATA_DIR)
-print("  KEY:", config.QWEN_API_KEY[:8] + "...")
-print("  URL:", config.QWEN_BASE_URL)
-print("  MODEL:", config.QWEN_MODEL_NAME)
 
-print("2. Data Loading:")
-ns_items = load_dataset("nation_standard_bench", config.NATION_STANDARD_BENCH_DIR)
-print("  NationStandardBench loaded count:", len(ns_items))
+def main():
+    """Reports dataset sizes without sending API requests or loading models."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env-file")
+    args = parser.parse_args()
+    settings = config.load_settings(args.env_file)
+    for name in ("nation_standard_bench", "doc_bench"):
+        items = load_dataset(name, settings["data_dir"])
+        print(name, len(items), "unique keys:",
+              len({item["question_key"] for item in items}))
 
-doc_items = load_dataset("doc_bench", config.DOC_BENCH_DIR)
-print("  DocBench loaded count:", len(doc_items))
+
+if __name__ == "__main__":
+    main()
