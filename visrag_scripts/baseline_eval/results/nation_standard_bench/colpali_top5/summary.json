@@ -1,0 +1,10 @@
+{
+  "dataset": "nation_standard_bench",
+  "retriever": "colpali",
+  "top_k": 5,
+  "total_questions": 1,
+  "completed_questions": 1,
+  "newly_processed_in_this_run": 1,
+  "total_tokens_accumulated": 19251,
+  "timestamp": "2026-10-23 21:03:12"
+}

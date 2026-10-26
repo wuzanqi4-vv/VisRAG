@@ -94,7 +94,8 @@ class ExperimentState:
             {key: row.get(key) for key in (
                 "dataset", "document_key", "doc_id", "question_id",
                 "question_key", "question", "ground_truth_answer",
-                "answer_normalized", "question_type", "prediction", "status")}
+                "answer_normalized", "question_type", "prediction", "status",
+                "evidence_text", "evidence", "reference_text")}
             for row in rows
         ])
         write_jsonl(self.directory / "retrieved_pages.jsonl", retrieved)

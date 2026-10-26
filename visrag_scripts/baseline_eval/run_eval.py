@@ -115,11 +115,14 @@ def main() -> None:
         }, ensure_ascii=False, indent=2))
         return
 
-    identity = fingerprint(manifest)
-    if not args.resume:
-        identity += "_" + uuid.uuid4().hex[:8]
-    directory = (settings["artifact_dir"] / "runs" / args.dataset
-                 / args.retriever / f"top{args.top_k}_{identity}")
+    if args.run_dir:
+        directory = Path(args.run_dir)
+    else:
+        identity = fingerprint(manifest)
+        if not args.resume:
+            identity += "_" + uuid.uuid4().hex[:8]
+        directory = (settings["artifact_dir"] / "runs" / args.dataset
+                     / args.retriever / f"top{args.top_k}_{identity}")
     cache_root = settings["artifact_dir"] / "cache"
     with run_lock(directory / "run.lock"):
         state = ExperimentState(directory, items)

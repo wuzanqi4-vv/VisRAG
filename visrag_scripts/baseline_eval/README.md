@@ -94,3 +94,51 @@ cd /home/wuzanqi/VisRAG/visrag_scripts/baseline_eval
 
 这些检查不会调用 API。`test_api.py` 仅在显式执行时发出一次真实请求，
 普通导入和 unittest/pytest 收集不会触发付费调用。
+
+## 独立 LLM 准确度评估
+
+`llm_evaluator.py` 按 DocBench 的二元正确性提示词评估保存的回答。
+评估与生成分开执行，可以对四组结果使用同一个评估模型和同一份配置。
+它使用现有 `.env` 的 Chat 配置；`--model` 可覆盖评估模型标识。
+若评估使用另一提供商，将其 CHAT 配置放入服务器的 `.env.evaluation`，
+再通过 `--env-file .env.evaluation` 指定，不需要修改生成配置。
+
+```bash
+cd /home/wuzanqi/VisRAG
+conda activate VisRAG
+python visrag_scripts/baseline_eval/llm_evaluator.py \
+    --input /实际生成运行目录/predictions.jsonl \
+    --env-file .env.evaluation \
+    --model 实际评估模型标识
+```
+
+参考文本依次读取 `ref_text`、`reference_text`、`evidence_text`、`evidence`。
+优先使用 `predictions.jsonl`，其中保留了原始证据文本；也支持新导出的
+`evaluation_input.jsonl`。没有参考文本时传空字符串，不根据证据页码编造文本。
+评估只读取已保存的回答，不重新检索或生成。输入文件应是冻结快照；
+输入、提示词、模型、端点或评分实现变化会建立独立的评估目录。
+
+空答案或去掉完整 `<think>` 块后只剩 `0` 的答案直接记 0 分，不发请求。
+其他答案由 LLM 评分；只接受 `0`、`1` 或 `Correctness: 0/1`。
+评估响应格式错误、超时或被截断时，有限重试，失败后保留空分数，不记为 0。
+尚未生成的 pending 题目不参与判错；生成失败而答案为空的题目按上述空答案规则记 0。
+
+结果默认保存在输入文件旁 `evaluations/<fingerprint>/`：
+
+- `judgments.jsonl`：逐题评分、原始评估输出、参考答案/文本与生成状态。
+- `api_requests.jsonl`：每次真实评估请求与重试的 usage、耗时和错误。
+- `state.sqlite3`：断点状态，成功评分不重复请求；`--retry-failed` 可增加尝试预算。
+- `summary.json`：题数、已评分数、正确数、准确率、已知 token 和缺失用量次数。
+- `manifest.json`：评分提示词、模型、输入指纹与协议版本，不含密钥。
+
+`accuracy` 为 0 到 1 的比例；有未完成或评估失败题目时保持 null，
+不对成功评分子集冒充完整准确率。直接记 0 的规则判定不产生 API 用量；
+真实请求缺少 usage 时 token 为 null。评估消耗与生成消耗各自保存。
+`--thinking-mode disabled` 可显式关闭支持该参数的评估模型的思考模式。
+
+离线验证（不会请求 API）：
+
+```bash
+cd /home/wuzanqi/VisRAG/visrag_scripts/baseline_eval
+python -m unittest test_llm_evaluator -v
+```
